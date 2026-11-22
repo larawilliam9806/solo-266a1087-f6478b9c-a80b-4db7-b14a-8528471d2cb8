@@ -5,6 +5,7 @@
 from collections import deque
 
 from .db import connect
+from .receipts import _apply_receipt, completed_by_shipments
 from .state import load_state
 
 
@@ -70,6 +71,7 @@ def register_documents(documents) -> dict:
             destinations[b] = ("shipment", sid)
 
         new_batches, new_incoming, new_shipments, new_processes = {}, [], [], []
+        new_receipts = []
 
         def note_weight(batch, weight):
             cur = weights.get(batch)
@@ -88,6 +90,9 @@ def register_documents(documents) -> dict:
                     raise ConflictError(f"批号 {doc.batch} 已有来源，不能重复登记进料")
                 sources[doc.batch] = ("incoming", None)
                 new_incoming.append(doc.batch)
+            elif doc.type in ("receipt", "weigh_ticket"):
+                # 磅单只记录实收净重，不确立批号的来源/去向，可早于发货单录入。
+                new_receipts.append(doc)
             elif doc.type == "shipment":
                 note_weight(doc.batch, doc.weight)
                 if doc.batch in destinations:
@@ -143,6 +148,17 @@ def register_documents(documents) -> dict:
             sid = conn.execute("INSERT INTO shipments(batch_no) VALUES (?)", (b,)).lastrowid
             shipment_ids.append(sid)
 
+        # 磅单登记/换交与本次发货同处一个事务：要么全部生效，要么全部回滚。
+        receipts_applied = []
+        for doc in new_receipts:
+            result = _apply_receipt(
+                conn, doc.ticket_no, doc.version,
+                [{"batch": i.batch, "weight": i.weight} for i in doc.items])
+            receipts_applied.append(result)
+
+        # 发货登记的回执：列出本次因补上发货单而齐单的磅单及其差额。
+        receipts_completed = completed_by_shipments(conn, new_shipments)
+
         conn.commit()
         return {
             "applied": True,
@@ -150,6 +166,9 @@ def register_documents(documents) -> dict:
             "incoming_registered": sorted(new_incoming),
             "process_ids": process_ids,
             "shipment_ids": shipment_ids,
+            "receipts": receipts_applied,
+            "receipts_completed": receipts_completed,
+            "completed_receipts": receipts_completed,  # 兼容别名
         }
     except Exception:
         conn.rollback()
